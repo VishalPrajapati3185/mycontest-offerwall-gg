@@ -7,13 +7,13 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const SECRET = process.env.OFFERWALL_SECRET;
+const PUBLIC_KEY = process.env.OFFERWALL_PUBLIC_KEY;
 const SERVICE_ACCOUNT_JSON = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
 
-if (!SECRET || !SERVICE_ACCOUNT_JSON) {
+if (!SECRET || !PUBLIC_KEY || !SERVICE_ACCOUNT_JSON) {
   throw new Error("Missing required environment variables");
 }
 
-// Firebase Admin initialization
 const serviceAccount = JSON.parse(SERVICE_ACCOUNT_JSON);
 
 admin.initializeApp({
@@ -22,8 +22,54 @@ admin.initializeApp({
 
 const db = admin.firestore();
 
+const wallets = db.collection("offerwall_gg_wallets");
+const transactions = db.collection("offerwall_gg_transactions");
+
 app.get("/", (req, res) => {
   res.status(200).send("MyContest Offerwall.GG Backend Running");
+});
+
+// Generate signed wall URL for authenticated Firebase user
+app.get("/signed-wall", async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || "";
+
+    if (!authHeader.startsWith("Bearer ")) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const idToken = authHeader.substring(7);
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    const userId = decoded.uid;
+
+    const params = {
+      appId: PUBLIC_KEY,
+      userId: userId,
+    };
+
+    const canonical = Object.keys(params)
+      .sort()
+      .map((key) => `${key}=${params[key]}`)
+      .join("&");
+
+    const signature = crypto
+      .createHmac("sha256", SECRET)
+      .update(canonical)
+      .digest("hex");
+
+    const wallUrl =
+      `https://offerwall.gg/wall/${PUBLIC_KEY}` +
+      `?userId=${encodeURIComponent(userId)}` +
+      `&signature=${signature}`;
+
+    return res.status(200).json({
+      success: true,
+      wallUrl: wallUrl,
+    });
+  } catch (error) {
+    console.error("Signed wall error:", error);
+    return res.status(401).json({ error: "Unauthorized" });
+  }
 });
 
 // Offerwall.GG Postback
@@ -43,7 +89,13 @@ app.get("/offerwall", async (req, res) => {
       payoutUsd,
     } = req.query;
 
-    if (!user || !tx || amount === undefined || !status || !sig) {
+    if (
+      typeof user !== "string" ||
+      typeof tx !== "string" ||
+      typeof amount !== "string" ||
+      typeof status !== "string" ||
+      typeof sig !== "string"
+    ) {
       return res.status(400).send("Missing parameters");
     }
 
@@ -51,7 +103,6 @@ app.get("/offerwall", async (req, res) => {
       return res.status(400).send("Invalid status");
     }
 
-    // Verify HMAC-SHA256 signature
     const signatureData = `${user}:${tx}:${amount}`;
 
     const expected = crypto
@@ -59,19 +110,24 @@ app.get("/offerwall", async (req, res) => {
       .update(signatureData)
       .digest("hex");
 
-    const receivedBuffer = Buffer.from(String(sig), "hex");
-    const expectedBuffer = Buffer.from(expected, "hex");
-
-    if (
-      receivedBuffer.length !== expectedBuffer.length ||
-      !crypto.timingSafeEqual(receivedBuffer, expectedBuffer)
-    ) {
+    if (!/^[a-fA-F0-9]{64}$/.test(sig)) {
       return res.status(403).send("Invalid signature");
     }
 
-    // Test postbacks must never credit Points
+    const receivedBuffer = Buffer.from(sig, "hex");
+    const expectedBuffer = Buffer.from(expected, "hex");
+
+    if (!crypto.timingSafeEqual(receivedBuffer, expectedBuffer)) {
+      return res.status(403).send("Invalid signature");
+    }
+
+    // Never credit test postbacks
     if (test === "1") {
       return res.status(200).send("ok");
+    }
+
+    if (test !== "0") {
+      return res.status(400).send("Invalid test value");
     }
 
     const points = Number(amount);
@@ -87,60 +143,60 @@ app.get("/offerwall", async (req, res) => {
       return res.status(400).send("Invalid amount for status");
     }
 
-    if (!/^[a-zA-Z0-9_-]{1,128}$/.test(String(user))) {
+    if (!/^[a-zA-Z0-9_-]{1,128}$/.test(user)) {
       return res.status(400).send("Invalid user ID");
     }
 
-    const transactionId = String(tx);
-
-    if (transactionId.length > 200) {
+    if (tx.length > 200) {
       return res.status(400).send("Invalid transaction ID");
     }
 
-    const walletRef = db.collection("offerwall_gg_wallets").doc(String(user));
+    const walletRef = wallets.doc(user);
 
-    // Hash transaction ID to create a safe Firestore document ID
     const transactionDocId = crypto
       .createHash("sha256")
-      .update(transactionId)
+      .update(tx)
       .digest("hex");
 
-    const transactionRef = db
-      .collection("offerwall_gg_transactions")
-      .doc(transactionDocId);
+    const transactionRef = transactions.doc(transactionDocId);
 
     await db.runTransaction(async (t) => {
       const transactionSnap = await t.get(transactionRef);
       const walletSnap = await t.get(walletRef);
 
+      const oldTransaction = transactionSnap.exists
+        ? transactionSnap.data()
+        : null;
+
+      if (oldTransaction && oldTransaction.userId !== user) {
+        throw new Error("Transaction user mismatch");
+      }
+
       const currentBalance = walletSnap.exists
         ? Number(walletSnap.data().points || 0)
         : 0;
 
-      if (!Number.isFinite(currentBalance)) {
+      if (!Number.isFinite(currentBalance) || currentBalance < 0) {
         throw new Error("Invalid wallet balance");
       }
 
       if (status === "credited") {
-        // Never credit the same transaction twice
-        if (transactionSnap.exists) {
-          const oldStatus = transactionSnap.data().status;
-
-          if (oldStatus === "credited" || oldStatus === "reversed") {
-            return;
-          }
+        // Prevent duplicate credits
+        if (oldTransaction) {
+          return;
         }
 
         t.set(walletRef, {
-          userId: String(user),
+          userId: user,
           points: currentBalance + points,
+          currencyName: currencyName || "Point",
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         }, { merge: true });
 
         t.set(transactionRef, {
-          userId: String(user),
-          transactionId,
-          points,
+          userId: user,
+          transactionId: tx,
+          points: points,
           status: "credited",
           currencyName: currencyName || "Point",
           offerId: offerId || "",
@@ -148,31 +204,26 @@ app.get("/offerwall", async (req, res) => {
           goalId: goalId || "",
           payoutUsd: payoutUsd || "",
           createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        }, { merge: true });
+        });
 
       } else {
-        // Reverse only a previously credited transaction
-        if (
-          !transactionSnap.exists ||
-          transactionSnap.data().status !== "credited"
-        ) {
+        // Reverse only an existing credited transaction
+        if (!oldTransaction || oldTransaction.status !== "credited") {
           return;
         }
 
-        const old = transactionSnap.data();
+        const reversalPoints = Number(oldTransaction.points);
 
-        if (old.userId !== String(user)) {
-          throw new Error("Transaction user mismatch");
+        if (!Number.isFinite(reversalPoints) || reversalPoints <= 0) {
+          throw new Error("Invalid original points");
         }
 
-        const reversalPoints = Math.abs(Number(old.points));
-
         if (currentBalance < reversalPoints) {
-          throw new Error("Insufficient wallet balance for reversal");
+          throw new Error("Insufficient wallet balance");
         }
 
         t.set(walletRef, {
-          userId: String(user),
+          userId: user,
           points: currentBalance - reversalPoints,
           updatedAt: admin.firestore.FieldValue.serverTimestamp(),
         }, { merge: true });
